@@ -16,6 +16,8 @@
 
 // C++
 #include <vector>
+#include <string>
+#include <map>
 
 static void msg(const char *msg)
 {
@@ -30,7 +32,7 @@ static void msg_errno(const char *msg)
 static void die(const char *msg)
 {
     int err = errno;
-    fprintf(stderr, "[%d] %s \n", err, msg);
+    fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
 
@@ -99,7 +101,7 @@ static Conn *handle_accept(int fd)
     }
 
     uint32_t ip = client_addr.sin_addr.s_addr;
-    fprintf(stderr, "new client from %u.%u.%u.%u.%u\n",
+    fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
             ip & 255, (ip >> 8) & 255, (ip > 16) & 255, ip >> 24, ntohs(client_addr.sin_port));
 
     // set the new connection fd to nonblocking mode
@@ -112,6 +114,134 @@ static Conn *handle_accept(int fd)
     return conn;
 }
 
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out)
+{
+    if (cur + 4 > end)
+    {
+        return false;
+    }
+    memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
+
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out)
+{
+    if (cur + n > end)
+    {
+        return false;
+    }
+    out.assign(cur, cur + n);
+    cur += n;
+    return true;
+}
+
+//+------+-----+------+-----+------+-----+-----+------+
+//| nstr | len | str1 | len | str2 | ... | len | strn |
+//+------+-----+------+-----+------+-----+-----+------+
+static int32_t
+parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out)
+{
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+    if (!read_u32(data, end, nstr))
+    {
+        return -1;
+    }
+    if (nstr > k_max_msg)
+    {
+        return -1; // safety limit
+    }
+
+    while (out.size() < nstr)
+    {
+        uint32_t len = 0;
+        if (!read_u32(data, end, len))
+        {
+            return -1;
+        }
+        out.push_back(std::string());
+        if (!read_str(data, end, len, out.back()))
+        {
+            return -1;
+        }
+    }
+    if (data != end)
+    {
+        return -1; // trailing garbage
+    }
+
+    return 0;
+}
+
+// Response::status
+enum
+{
+    RES_OK = 0,
+    RES_ERR = 1, // error
+    RES_NX = 2,  // key not found
+};
+
+//+--------+---------+
+//| status | data... |
+//+--------+---------+
+struct Response
+{
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
+
+// placehold; implemented later
+static std::map<std::string, std::string> g_data;
+
+static void do_request(std::vector<std::string> &cmd, Response &out)
+{
+
+    printf("Command size: %zu\n", cmd.size());
+    for (size_t i = 0; i < cmd.size(); i++) {
+        printf("  cmd[%zu]: '%s'\n", i, cmd[i].c_str());
+    }
+    if (cmd.size() == 2 && cmd[0] == "get")
+    {
+        auto it = g_data.find(cmd[1]);
+        if (it == g_data.end())
+        {
+            out.status = RES_NX; // not found
+            return;
+        }
+
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    }
+    else if (cmd.size() == 3 && cmd[0] == "set")
+    {
+        g_data[cmd[1]].swap(cmd[2]);
+    }
+    else if (cmd.size() == 2 && cmd[0] == "del")
+    {
+        g_data.erase(cmd[1]);
+    }
+    else
+    {
+        out.status = RES_ERR; // unrecognized command
+    }
+}
+
+static void make_response(const Response &res, std::vector<uint8_t> &out)
+{
+     // ----- PRINT RESPONSE BEFORE SENDING -----
+    printf("Sending response - Status: %u, Data length: %zu", res.status, res.data.size());
+    if (res.data.size() > 0) {
+        printf(", Data: %.*s", (int)res.data.size(), res.data.data());
+    }
+    printf("\n");
+
+    
+    uint32_t resp_len = 4 + (uint32_t)res.data.size();
+    buf_append(out, (const uint8_t *)&resp_len, 4);
+    buf_append(out, (const uint8_t *)&res.status, 4);
+    buf_append(out, res.data.data(), res.data.size());
+}
 // process one request if there is enough data
 
 static bool try_one_request(Conn *conn)
@@ -140,12 +270,17 @@ static bool try_one_request(Conn *conn)
     const uint8_t *request = &conn->incoming[4];
 
     // got  one request, do some application logic
-    printf("client says: len:%d, data:%.*s",
-           len, len < 100 ? len : 100, request);
+    std::vector<std::string> cmd;
+    if (parse_req(request, len, cmd) < 0)
+    {
+        msg("bad request");
+        conn->want_close = true;
+        return false;
+    }
 
-    // generate the response (echo)
-    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(conn->outgoing, request, len);
+    Response resp;
+    do_request(cmd, resp);
+    make_response(resp, conn->outgoing);
 
     // application logic done! remove the request message
     buf_consume(conn->incoming, 4 + len);
@@ -222,20 +357,20 @@ static void handle_read(Conn *conn)
     // parse requests and generate response
     while (try_one_request(conn))
     {
-        // Q: why calling this in loop? see the explanation of 'pipelining'
-
-        // update the readiness intention
-        if (conn->outgoing.size() > 0)
-        {
-            // has a response
-            conn->want_read = false;
-            conn->want_write = true;
-
-            // The socket is ready to write in a request-response protocol
-            // try to write it without waiting for the next iteration
-            return handle_write(conn);
-        } // else: want read
     }
+    // Q: why calling this in loop? see the explanation of 'pipelining'
+
+    // update the readiness intention
+    if (conn->outgoing.size() > 0)
+    {
+        // has a response
+        conn->want_read = false;
+        conn->want_write = true;
+
+        // The socket is ready to write in a request-response protocol
+        // try to write it without waiting for the next iteration
+        return handle_write(conn);
+    } // else: want read
 }
 int main()
 {
@@ -336,7 +471,7 @@ int main()
 
         // handle connections
         // skip the 1st connection
-        for (size_t i = i; i < poll_args.size(); ++i)
+        for (size_t i = 1; i < poll_args.size(); ++i)
         {
             uint32_t ready = poll_args[i].revents;
             if (ready == 0)
